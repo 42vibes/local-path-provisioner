@@ -204,11 +204,11 @@ Please note that `nodePathMap`, `sharedFileSystemPath`, and `storageClassConfigs
 
 The `setupCommand` and `teardownCommand` allow you to specify the path to binary files in helperPod that will be called when creating or deleting pvc respectively. This can be useful if you need to use distroless images for security reasons. See the examples/distroless directory for an example. A binary file can take the following parameters:
 | Parameter | Description |
-| -------------------- | ----------- |
-| -p | Volume directory that should be created or removed. | -m | -p | Volume directory that should be created or removed. |
-| -m | The PersistentVolume mode (`Block` or `Filesystem`). | -m | The PersistentVolume mode (`Block` or `Filesystem`). |
-| -s | Requested volume size in bytes. | -s | Requested volume size in bytes. |
-| -a | Action type. Can be `create` or `delete` | -a | -a | Action type.
+| --- | --- |
+| `-p` | Volume directory that should be created or removed. |
+| `-m` | The PersistentVolume mode (`Block` or `Filesystem`). |
+| `-s` | Requested volume size in bytes. |
+| `-a` | Action type. Can be `create` or `delete`. |
 
 The `setupCommand` and `teardownCommand` have higher priority than the `setup` and `teardown` scripts from the ConfigMap.  
 
@@ -237,6 +237,53 @@ The scripts receive their input as environment variables:
 | `VOL_DIR` | Volume directory that should be created or removed. |
 | `VOL_MODE` | The PersistentVolume mode (`Block` or `Filesystem`). |
 | `VOL_SIZE_BYTES` | Requested volume size in bytes. |
+| `VOL_NAME` | PersistentVolume name. |
+
+#### XFS Project Quotas
+
+Local and hostPath PersistentVolumes do not enforce `spec.capacity.storage` by themselves. The capacity value is Kubernetes metadata unless the backing filesystem enforces a limit.
+
+The provisioner can enforce requested PVC size with XFS project quotas. This is opt-in per storage class configuration:
+
+```json
+{
+  "storageClassConfigs": {
+    "local-path-xfs-quota": {
+      "nodePathMap": [
+        {
+          "node": "DEFAULT_PATH_FOR_NON_LISTED_NODES",
+          "paths": ["/mnt/xfs-local-path"]
+        }
+      ],
+      "quota": {
+        "type": "xfsProject",
+        "projectsFile": "/etc/projects",
+        "projidFile": "/etc/projid",
+        "lockDir": "/var/lib/local-path-provisioner/quota-lock",
+        "projectIDStart": 1048576,
+        "projectIDEnd": 2147483647
+      }
+    }
+  }
+}
+```
+
+Requirements:
+
+1. The configured path must be on XFS mounted with project quota support (`prjquota` or `pquota`).
+2. The helper image must contain `xfs_quota` and standard shell tools such as `awk`, `sed`, `stat`, `mkdir`, and `rm`.
+3. Quota-enabled paths must use `nodePathMap`; `sharedFileSystemPath` is rejected for `xfsProject` quota.
+4. Volume expansion is not supported for quota-enabled storage classes. Leave `allowVolumeExpansion` unset or `false`.
+
+When enabled, the helper pod fails provisioning if the selected base path is not XFS. This avoids creating a PV whose Kubernetes capacity says one thing while the filesystem allows unlimited writes.
+
+The provisioner injects the minimal host mounts and privileged helper setting required for XFS quota management. This does not require `ALLOW_UNSAFE_HELPER_POD_TEMPLATE=true`; that flag still means the user-provided helper pod template can define arbitrary unsafe fields and should remain disabled unless an administrator explicitly needs it.
+
+Resize behavior:
+
+- If `allowVolumeExpansion` is not enabled, Kubernetes rejects PVC storage increases before the provisioner needs to do anything.
+- If an administrator manually enables `allowVolumeExpansion`, this provisioner still does not update the XFS quota. The PVC/PV may show a larger requested size while the filesystem continues enforcing the original quota.
+- Shrinking PVCs is not supported by Kubernetes and must not be treated as a quota-reduction path.
 
 #### Reloading
 

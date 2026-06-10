@@ -9,9 +9,12 @@ configMapGenerator:
   namespace: local-path-storage
   behavior: merge
   files:
+  - config.json
   - helperPod.yaml
   - setup
+  - setup-xfs-project-quota
   - teardown
+  - teardown-xfs-project-quota
 
 generatorOptions:
   disableNameSuffixHash: true
