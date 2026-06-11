@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: local-path-provisioner
+  namespace: local-path-storage
+spec:
+  template:
+    spec:
+      containers:
+      - name: local-path-provisioner
+        command:
+        - local-path-provisioner
+        - --debug
+        - start
+        - --config
+        - /etc/config/config.json
+        - --allow-privileged-xfs-project-quota
+        - --xfs-project-quota-helper-image
+        - ghcr.io/42vibes/local-path-xfs-quota-helper:xfs-project-quotas

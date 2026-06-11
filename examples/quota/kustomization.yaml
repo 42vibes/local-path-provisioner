@@ -4,11 +4,15 @@ kind: Kustomization
 resources:
 - ../../deploy
 
+patches:
+- path: enable-xfs-quota-patch.yaml
+
 configMapGenerator:
 - name: local-path-config
   namespace: local-path-storage
   behavior: merge
   files:
+  - config.json
   - helperPod.yaml
   - setup
   - teardown

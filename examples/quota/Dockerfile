@@ -1,3 +1,3 @@
-From centos:7
-RUN yum install -y xfsprogs
+FROM alpine:3.24
 
+RUN apk add --no-cache xfsprogs

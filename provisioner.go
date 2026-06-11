@@ -33,6 +33,13 @@ const (
 	ActionTypeDelete = "delete"
 )
 
+type QuotaType string
+
+const (
+	QuotaTypeNone       QuotaType = ""
+	QuotaTypeXFSProject QuotaType = "xfsProject"
+)
+
 const (
 	DefaultNodeAffinityKey = "kubernetes.io/hostname"
 
@@ -45,11 +52,36 @@ const (
 	envVolDir  = "VOL_DIR"
 	envVolMode = "VOL_MODE"
 	envVolSize = "VOL_SIZE_BYTES"
+	envVolName = "VOL_NAME"
 )
 
 const (
 	defaultCmdTimeoutSeconds = 120
 	defaultVolumeType        = "hostPath"
+)
+
+const (
+	defaultQuotaProjectsFile   = "/etc/projects"
+	defaultQuotaProjidFile     = "/etc/projid"
+	defaultQuotaLockDir        = "/var/lib/local-path-provisioner/quota-lock"
+	defaultQuotaProjectIDStart = int64(1048576)
+	defaultQuotaProjectIDEnd   = int64(2147483647)
+)
+
+const (
+	helperQuotaProjectsVolName = "xfs-quota-projects"
+	helperQuotaProjidVolName   = "xfs-quota-projid"
+	helperQuotaDeviceVolName   = "xfs-quota-dev"
+	helperQuotaLockVolName     = "xfs-quota-lock"
+)
+
+const (
+	envQuotaType           = "LOCAL_PATH_QUOTA_TYPE"
+	envQuotaProjectsFile   = "LOCAL_PATH_QUOTA_PROJECTS_FILE"
+	envQuotaProjidFile     = "LOCAL_PATH_QUOTA_PROJID_FILE"
+	envQuotaProjectIDStart = "LOCAL_PATH_QUOTA_PROJECT_ID_START"
+	envQuotaProjectIDEnd   = "LOCAL_PATH_QUOTA_PROJECT_ID_END"
+	envQuotaLockDir        = "LOCAL_PATH_QUOTA_LOCK_DIR"
 )
 
 const (
@@ -69,13 +101,15 @@ type LocalPathProvisioner struct {
 	helperImage        string
 	serviceAccountName string
 
-	config                       *Config
-	configData                   *ConfigData
-	configFile                   string
-	configMapName                string
-	configMutex                  *sync.RWMutex
-	helperPod                    *v1.Pod
-	allowUnsafeHelperPodTemplate bool
+	config                         *Config
+	configData                     *ConfigData
+	configFile                     string
+	configMapName                  string
+	configMutex                    *sync.RWMutex
+	helperPod                      *v1.Pod
+	allowUnsafeHelperPodTemplate   bool
+	allowPrivilegedXFSProjectQuota bool
+	xfsProjectQuotaHelperImage     string
 }
 
 type NodePathMapData struct {
@@ -86,6 +120,16 @@ type NodePathMapData struct {
 type StorageClassConfigData struct {
 	NodePathMap          []*NodePathMapData `json:"nodePathMap,omitempty"`
 	SharedFileSystemPath string             `json:"sharedFileSystemPath,omitempty"`
+	Quota                *QuotaConfigData   `json:"quota,omitempty"`
+}
+
+type QuotaConfigData struct {
+	Type           string `json:"type,omitempty"`
+	ProjectsFile   string `json:"projectsFile,omitempty"`
+	ProjidFile     string `json:"projidFile,omitempty"`
+	LockDir        string `json:"lockDir,omitempty"`
+	ProjectIDStart int64  `json:"projectIDStart,omitempty"`
+	ProjectIDEnd   int64  `json:"projectIDEnd,omitempty"`
 }
 
 type ConfigData struct {
@@ -99,6 +143,16 @@ type ConfigData struct {
 type StorageClassConfig struct {
 	NodePathMap          map[string]*NodePathMap
 	SharedFileSystemPath string
+	Quota                QuotaConfig
+}
+
+type QuotaConfig struct {
+	Type           QuotaType
+	ProjectsFile   string
+	ProjidFile     string
+	LockDir        string
+	ProjectIDStart int64
+	ProjectIDEnd   int64
 }
 
 type NodePathMap struct {
@@ -114,7 +168,8 @@ type Config struct {
 }
 
 func NewProvisioner(ctx context.Context, kubeClient *clientset.Clientset,
-	configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml string, allowUnsafeHelperPodTemplate bool) (*LocalPathProvisioner, error) {
+	configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml string,
+	allowUnsafeHelperPodTemplate, allowPrivilegedXFSProjectQuota bool, xfsProjectQuotaHelperImage string) (*LocalPathProvisioner, error) {
 	p := &LocalPathProvisioner{
 		ctx: ctx,
 
@@ -124,12 +179,14 @@ func NewProvisioner(ctx context.Context, kubeClient *clientset.Clientset,
 		serviceAccountName: serviceAccountName,
 
 		// config will be updated shortly by p.refreshConfig()
-		config:                       nil,
-		configFile:                   configFile,
-		configData:                   nil,
-		configMapName:                configMapName,
-		configMutex:                  &sync.RWMutex{},
-		allowUnsafeHelperPodTemplate: allowUnsafeHelperPodTemplate,
+		config:                         nil,
+		configFile:                     configFile,
+		configData:                     nil,
+		configMapName:                  configMapName,
+		configMutex:                    &sync.RWMutex{},
+		allowUnsafeHelperPodTemplate:   allowUnsafeHelperPodTemplate,
+		allowPrivilegedXFSProjectQuota: allowPrivilegedXFSProjectQuota,
+		xfsProjectQuotaHelperImage:     xfsProjectQuotaHelperImage,
 	}
 	var err error
 	p.helperPod, err = loadHelperPodFile(helperPodYaml, p.allowUnsafeHelperPodTemplate)
@@ -155,7 +212,7 @@ func (p *LocalPathProvisioner) refreshConfig() error {
 	if reflect.DeepEqual(configData, p.configData) {
 		return nil
 	}
-	config, err := canonicalizeConfig(configData)
+	config, err := canonicalizeConfig(configData, p.allowPrivilegedXFSProjectQuota)
 	if err != nil {
 		return err
 	}
@@ -421,12 +478,7 @@ func (p *LocalPathProvisioner) provisionFor(opts pvController.ProvisionOptions, 
 	}
 
 	storage := pvc.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
-	provisionCmd := make([]string, 0, 2)
-	if p.config.SetupCommand == "" {
-		provisionCmd = append(provisionCmd, "/bin/sh", "/script/setup")
-	} else {
-		provisionCmd = append(provisionCmd, p.config.SetupCommand)
-	}
+	provisionCmd, _ := commandAndScriptKeysForAction(ActionTypeCreate, p.config.SetupCommand, p.config.TeardownCommand, c.Quota)
 	if err := p.createHelperPod(ActionTypeCreate, provisionCmd, volumeOptions{
 		Name:        name,
 		Path:        path,
@@ -535,12 +587,7 @@ func (p *LocalPathProvisioner) deleteFor(pv *v1.PersistentVolume, c *StorageClas
 			logrus.Infof("Deleting volume %v at %v:%v", pv.Name, node, path)
 		}
 		storage := pv.Spec.Capacity[v1.ResourceName(v1.ResourceStorage)]
-		cleanupCmd := make([]string, 0, 2)
-		if p.config.TeardownCommand == "" {
-			cleanupCmd = append(cleanupCmd, "/bin/sh", "/script/teardown")
-		} else {
-			cleanupCmd = append(cleanupCmd, p.config.TeardownCommand)
-		}
+		cleanupCmd, _ := commandAndScriptKeysForAction(ActionTypeDelete, p.config.SetupCommand, p.config.TeardownCommand, c.Quota)
 		if err := p.createHelperPod(ActionTypeDelete, cleanupCmd, volumeOptions{
 			Name:        pv.Name,
 			Path:        path,
@@ -657,21 +704,14 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, 
 		},
 	}
 	helperPod := p.helperPod.DeepCopy()
-
-	keyToPathItems := make([]v1.KeyToPath, 0, 2)
-
-	if p.config.SetupCommand == "" {
-		keyToPathItems = append(keyToPathItems, v1.KeyToPath{
-			Key:  "setup",
-			Path: "setup",
-		})
+	if err := applyQuotaToHelperPod(helperPod, cfg.Quota, p.xfsProjectQuotaHelperImage); err != nil {
+		return err
 	}
 
-	if p.config.TeardownCommand == "" {
-		keyToPathItems = append(keyToPathItems, v1.KeyToPath{
-			Key:  "teardown",
-			Path: "teardown",
-		})
+	_, scriptKeys := commandAndScriptKeysForAction(action, p.config.SetupCommand, p.config.TeardownCommand, cfg.Quota)
+	keyToPathItems := make([]v1.KeyToPath, 0, len(scriptKeys))
+	for _, key := range scriptKeys {
+		keyToPathItems = append(keyToPathItems, configMapKeyToPath(key))
 	}
 
 	if len(keyToPathItems) > 0 {
@@ -700,6 +740,7 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, 
 		return fmt.Errorf("invalid path %v for %v: cannot find parent dir or volume dir or parent dir is relative", action, o.Path)
 	}
 	env := []v1.EnvVar{
+		{Name: envVolName, Value: o.Name},
 		{Name: envVolDir, Value: filepath.Join(parentDir, volumeDir)},
 		{Name: envVolMode, Value: string(o.Mode)},
 		{Name: envVolSize, Value: strconv.FormatInt(o.SizeInBytes, 10)},
@@ -782,6 +823,118 @@ func addVolumeMount(mounts *[]v1.VolumeMount, name, mountPath string) *v1.Volume
 	return &(*mounts)[len(*mounts)-1]
 }
 
+func configMapKeyToPath(key string) v1.KeyToPath {
+	return v1.KeyToPath{Key: key, Path: key}
+}
+
+func commandAndScriptKeysForAction(action ActionType, setupCommand, teardownCommand string, quota QuotaConfig) ([]string, []string) {
+	switch action {
+	case ActionTypeCreate:
+		if quota.Type == QuotaTypeXFSProject {
+			return []string{"/bin/sh", "-ec", xfsQuotaSetupScript}, nil
+		}
+		if setupCommand != "" {
+			return []string{setupCommand}, nil
+		}
+		return []string{"/bin/sh", filepath.Join(helperScriptDir, "setup")}, []string{"setup"}
+	case ActionTypeDelete:
+		if quota.Type == QuotaTypeXFSProject {
+			return []string{"/bin/sh", "-ec", xfsQuotaTeardownScript}, nil
+		}
+		if teardownCommand != "" {
+			return []string{teardownCommand}, nil
+		}
+		return []string{"/bin/sh", filepath.Join(helperScriptDir, "teardown")}, []string{"teardown"}
+	default:
+		return nil, nil
+	}
+}
+
+func ensureMountPathAvailable(container *v1.Container, mountPath string) error {
+	for _, mount := range container.VolumeMounts {
+		if mount.MountPath == mountPath {
+			return fmt.Errorf("quota mount path %s is already used by volume %s", mountPath, mount.Name)
+		}
+	}
+	return nil
+}
+
+func applyQuotaToHelperPod(helperPod *v1.Pod, quota QuotaConfig, xfsProjectQuotaHelperImage string) error {
+	if quota.Type == QuotaTypeNone {
+		return nil
+	}
+	if quota.Type != QuotaTypeXFSProject {
+		return fmt.Errorf("unsupported quota type %q", quota.Type)
+	}
+	if len(helperPod.Spec.Containers) == 0 {
+		return fmt.Errorf("helper pod template does not specify any container")
+	}
+
+	container := &helperPod.Spec.Containers[0]
+	xfsProjectQuotaHelperImage = strings.TrimSpace(xfsProjectQuotaHelperImage)
+	if xfsProjectQuotaHelperImage == "" {
+		return fmt.Errorf("xfsProject quota requires %s", FlagXFSProjectQuotaHelperImage)
+	}
+	container.Image = xfsProjectQuotaHelperImage
+
+	for _, mountPath := range []string{quota.ProjectsFile, quota.ProjidFile, quota.LockDir, "/dev"} {
+		if err := ensureMountPathAvailable(container, mountPath); err != nil {
+			return err
+		}
+	}
+
+	privileged := true
+	if container.SecurityContext == nil {
+		container.SecurityContext = &v1.SecurityContext{}
+	}
+	container.SecurityContext.Privileged = &privileged
+
+	fileOrCreate := v1.HostPathFileOrCreate
+	directory := v1.HostPathDirectory
+	directoryOrCreate := v1.HostPathDirectoryOrCreate
+	helperPod.Spec.Volumes = append(helperPod.Spec.Volumes,
+		v1.Volume{
+			Name: helperQuotaProjectsVolName,
+			VolumeSource: v1.VolumeSource{
+				HostPath: &v1.HostPathVolumeSource{Path: quota.ProjectsFile, Type: &fileOrCreate},
+			},
+		},
+		v1.Volume{
+			Name: helperQuotaProjidVolName,
+			VolumeSource: v1.VolumeSource{
+				HostPath: &v1.HostPathVolumeSource{Path: quota.ProjidFile, Type: &fileOrCreate},
+			},
+		},
+		v1.Volume{
+			Name: helperQuotaDeviceVolName,
+			VolumeSource: v1.VolumeSource{
+				HostPath: &v1.HostPathVolumeSource{Path: "/dev", Type: &directory},
+			},
+		},
+		v1.Volume{
+			Name: helperQuotaLockVolName,
+			VolumeSource: v1.VolumeSource{
+				HostPath: &v1.HostPathVolumeSource{Path: quota.LockDir, Type: &directoryOrCreate},
+			},
+		},
+	)
+	container.VolumeMounts = append(container.VolumeMounts,
+		v1.VolumeMount{Name: helperQuotaProjectsVolName, MountPath: quota.ProjectsFile},
+		v1.VolumeMount{Name: helperQuotaProjidVolName, MountPath: quota.ProjidFile},
+		v1.VolumeMount{Name: helperQuotaDeviceVolName, MountPath: "/dev"},
+		v1.VolumeMount{Name: helperQuotaLockVolName, MountPath: quota.LockDir},
+	)
+	container.Env = append(container.Env,
+		v1.EnvVar{Name: envQuotaType, Value: string(quota.Type)},
+		v1.EnvVar{Name: envQuotaProjectsFile, Value: quota.ProjectsFile},
+		v1.EnvVar{Name: envQuotaProjidFile, Value: quota.ProjidFile},
+		v1.EnvVar{Name: envQuotaProjectIDStart, Value: strconv.FormatInt(quota.ProjectIDStart, 10)},
+		v1.EnvVar{Name: envQuotaProjectIDEnd, Value: strconv.FormatInt(quota.ProjectIDEnd, 10)},
+		v1.EnvVar{Name: envQuotaLockDir, Value: quota.LockDir},
+	)
+	return nil
+}
+
 func isJSONFile(configFile string) bool {
 	return strings.HasSuffix(configFile, ".json")
 }
@@ -818,10 +971,10 @@ func loadConfigFile(configFile string) (cfgData *ConfigData, err error) {
 	return &data, nil
 }
 
-func canonicalizeConfig(data *ConfigData) (cfg *Config, err error) {
+func canonicalizeConfig(data *ConfigData, allowPrivilegedXFSProjectQuota bool) (cfg *Config, err error) {
 	cfg = &Config{}
 	if len(data.StorageClassConfigs) == 0 {
-		defaultConfig, err := canonicalizeStorageClassConfig(&data.StorageClassConfigData)
+		defaultConfig, err := canonicalizeStorageClassConfig(&data.StorageClassConfigData, allowPrivilegedXFSProjectQuota)
 		if err != nil {
 			return nil, err
 		}
@@ -829,7 +982,7 @@ func canonicalizeConfig(data *ConfigData) (cfg *Config, err error) {
 	} else {
 		cfg.StorageClassConfigs = make(map[string]StorageClassConfig, len(data.StorageClassConfigs))
 		for name, classData := range data.StorageClassConfigs {
-			classCfg, err := canonicalizeStorageClassConfig(&classData)
+			classCfg, err := canonicalizeStorageClassConfig(&classData, allowPrivilegedXFSProjectQuota)
 			if err != nil {
 				return nil, errors.Wrap(err, fmt.Sprintf("config for class %s is invalid", name))
 			}
@@ -846,7 +999,65 @@ func canonicalizeConfig(data *ConfigData) (cfg *Config, err error) {
 	return cfg, nil
 }
 
-func canonicalizeStorageClassConfig(data *StorageClassConfigData) (cfg *StorageClassConfig, err error) {
+func canonicalizeQuotaConfig(data *QuotaConfigData, hasNodePathMap, hasSharedFileSystemPath, allowPrivilegedXFSProjectQuota bool) (QuotaConfig, error) {
+	if data == nil || data.Type == "" {
+		return QuotaConfig{Type: QuotaTypeNone}, nil
+	}
+
+	cfg := QuotaConfig{
+		Type:           QuotaType(data.Type),
+		ProjectsFile:   data.ProjectsFile,
+		ProjidFile:     data.ProjidFile,
+		LockDir:        data.LockDir,
+		ProjectIDStart: data.ProjectIDStart,
+		ProjectIDEnd:   data.ProjectIDEnd,
+	}
+	if cfg.ProjectsFile == "" {
+		cfg.ProjectsFile = defaultQuotaProjectsFile
+	}
+	if cfg.ProjidFile == "" {
+		cfg.ProjidFile = defaultQuotaProjidFile
+	}
+	if cfg.LockDir == "" {
+		cfg.LockDir = defaultQuotaLockDir
+	}
+	if cfg.ProjectIDStart == 0 {
+		cfg.ProjectIDStart = defaultQuotaProjectIDStart
+	}
+	if cfg.ProjectIDEnd == 0 {
+		cfg.ProjectIDEnd = defaultQuotaProjectIDEnd
+	}
+	if cfg.ProjectIDStart > cfg.ProjectIDEnd {
+		return QuotaConfig{}, fmt.Errorf("projectIDStart must be less than or equal to projectIDEnd")
+	}
+	if !filepath.IsAbs(cfg.ProjectsFile) {
+		return QuotaConfig{}, fmt.Errorf("projectsFile must be absolute: %s", cfg.ProjectsFile)
+	}
+	if !filepath.IsAbs(cfg.ProjidFile) {
+		return QuotaConfig{}, fmt.Errorf("projidFile must be absolute: %s", cfg.ProjidFile)
+	}
+	if !filepath.IsAbs(cfg.LockDir) {
+		return QuotaConfig{}, fmt.Errorf("lockDir must be absolute: %s", cfg.LockDir)
+	}
+	if cfg.ProjectsFile != defaultQuotaProjectsFile || cfg.ProjidFile != defaultQuotaProjidFile || cfg.LockDir != defaultQuotaLockDir {
+		return QuotaConfig{}, fmt.Errorf("custom quota metadata paths are not allowed")
+	}
+
+	switch cfg.Type {
+	case QuotaTypeXFSProject:
+		if !allowPrivilegedXFSProjectQuota {
+			return QuotaConfig{}, fmt.Errorf("xfsProject quota requires %s", FlagAllowPrivilegedXFSProjectQuota)
+		}
+		if !hasNodePathMap || hasSharedFileSystemPath {
+			return QuotaConfig{}, fmt.Errorf("xfsProject quota requires nodePathMap")
+		}
+		return cfg, nil
+	default:
+		return QuotaConfig{}, fmt.Errorf("unsupported quota type %q", data.Type)
+	}
+}
+
+func canonicalizeStorageClassConfig(data *StorageClassConfigData, allowPrivilegedXFSProjectQuota bool) (cfg *StorageClassConfig, err error) {
 	defer func() {
 		err = errors.Wrapf(err, "StorageClass config canonicalization failed")
 	}()
@@ -876,6 +1087,11 @@ func canonicalizeStorageClassConfig(data *StorageClassConfigData) (cfg *StorageC
 			npMap.Paths[path] = struct{}{}
 		}
 	}
+	quota, err := canonicalizeQuotaConfig(data.Quota, len(cfg.NodePathMap) > 0, cfg.SharedFileSystemPath != "", allowPrivilegedXFSProjectQuota)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Quota = quota
 
 	return cfg, nil
 }

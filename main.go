@@ -22,37 +22,41 @@ import (
 )
 
 var (
-	VERSION                          = "0.0.1"
-	FlagConfigFile                   = "config"
-	FlagProvisionerName              = "provisioner-name"
-	EnvProvisionerName               = "PROVISIONER_NAME"
-	DefaultProvisionerName           = "rancher.io/local-path"
-	FlagNamespace                    = "namespace"
-	EnvNamespace                     = "POD_NAMESPACE"
-	DefaultNamespace                 = "local-path-storage"
-	FlagHelperImage                  = "helper-image"
-	EnvHelperImage                   = "HELPER_IMAGE"
-	DefaultHelperImage               = "rancher/library-busybox:1.32.1"
-	FlagServiceAccountName           = "service-account-name"
-	DefaultServiceAccount            = "local-path-provisioner-service-account"
-	EnvServiceAccountName            = "SERVICE_ACCOUNT_NAME"
-	FlagKubeconfig                   = "kubeconfig"
-	DefaultConfigFileKey             = "config.json"
-	DefaultConfigMapName             = "local-path-config"
-	FlagConfigMapName                = "configmap-name"
-	FlagHelperPodFile                = "helper-pod-file"
-	DefaultHelperPodFile             = "helperPod.yaml"
-	FlagWorkerThreads                = "worker-threads"
-	DefaultWorkerThreads             = pvController.DefaultThreadiness
-	FlagProvisioningRetryCount       = "provisioning-retry-count"
-	DefaultProvisioningRetryCount    = pvController.DefaultFailedProvisionThreshold
-	FlagDeletionRetryCount           = "deletion-retry-count"
-	DefaultDeletionRetryCount        = pvController.DefaultFailedDeleteThreshold
-	FlagAllowUnsafeHelperPodTemplate = "allow-unsafe-helper-pod-template"
-	EnvConfigMountPath               = "CONFIG_MOUNT_PATH"
-	EnvAllowUnsafeHelperPodTemplate  = "ALLOW_UNSAFE_HELPER_POD_TEMPLATE"
-	FlagKubeClientBurst              = "kube-client-burst"
-	FlagKubeClientQPS                = "kube-client-qps"
+	VERSION                            = "0.0.1"
+	FlagConfigFile                     = "config"
+	FlagProvisionerName                = "provisioner-name"
+	EnvProvisionerName                 = "PROVISIONER_NAME"
+	DefaultProvisionerName             = "rancher.io/local-path"
+	FlagNamespace                      = "namespace"
+	EnvNamespace                       = "POD_NAMESPACE"
+	DefaultNamespace                   = "local-path-storage"
+	FlagHelperImage                    = "helper-image"
+	EnvHelperImage                     = "HELPER_IMAGE"
+	DefaultHelperImage                 = "rancher/library-busybox:1.32.1"
+	FlagServiceAccountName             = "service-account-name"
+	DefaultServiceAccount              = "local-path-provisioner-service-account"
+	EnvServiceAccountName              = "SERVICE_ACCOUNT_NAME"
+	FlagKubeconfig                     = "kubeconfig"
+	DefaultConfigFileKey               = "config.json"
+	DefaultConfigMapName               = "local-path-config"
+	FlagConfigMapName                  = "configmap-name"
+	FlagHelperPodFile                  = "helper-pod-file"
+	DefaultHelperPodFile               = "helperPod.yaml"
+	FlagWorkerThreads                  = "worker-threads"
+	DefaultWorkerThreads               = pvController.DefaultThreadiness
+	FlagProvisioningRetryCount         = "provisioning-retry-count"
+	DefaultProvisioningRetryCount      = pvController.DefaultFailedProvisionThreshold
+	FlagDeletionRetryCount             = "deletion-retry-count"
+	DefaultDeletionRetryCount          = pvController.DefaultFailedDeleteThreshold
+	FlagAllowUnsafeHelperPodTemplate   = "allow-unsafe-helper-pod-template"
+	FlagAllowPrivilegedXFSProjectQuota = "allow-privileged-xfs-project-quota"
+	FlagXFSProjectQuotaHelperImage     = "xfs-project-quota-helper-image"
+	EnvConfigMountPath                 = "CONFIG_MOUNT_PATH"
+	EnvAllowUnsafeHelperPodTemplate    = "ALLOW_UNSAFE_HELPER_POD_TEMPLATE"
+	EnvAllowPrivilegedXFSProjectQuota  = "ALLOW_PRIVILEGED_XFS_PROJECT_QUOTA"
+	EnvXFSProjectQuotaHelperImage      = "XFS_PROJECT_QUOTA_HELPER_IMAGE"
+	FlagKubeClientBurst                = "kube-client-burst"
+	FlagKubeClientQPS                  = "kube-client-qps"
 )
 
 func cmdNotFound(_ *cli.Context, command string) {
@@ -140,6 +144,17 @@ func StartCmd() cli.Command {
 				Name:   FlagAllowUnsafeHelperPodTemplate,
 				Usage:  "Allow helper pod templates to set unsafe pod fields such as securityContext or custom volumes.",
 				EnvVar: EnvAllowUnsafeHelperPodTemplate,
+			},
+			cli.BoolFlag{
+				Name:   FlagAllowPrivilegedXFSProjectQuota,
+				Usage:  "Allow xfsProject quota to create privileged helper pods with required host mounts. Treat local-path-config write access as node-admin when enabled.",
+				EnvVar: EnvAllowPrivilegedXFSProjectQuota,
+			},
+			cli.StringFlag{
+				Name:   FlagXFSProjectQuotaHelperImage,
+				Usage:  "Dedicated helper image used only for xfsProject quota helpers. Required when xfsProject quota is enabled.",
+				EnvVar: EnvXFSProjectQuotaHelperImage,
+				Value:  "",
 			},
 			cli.IntFlag{
 				Name:  FlagKubeClientBurst,
@@ -288,6 +303,8 @@ func startDaemon(c *cli.Context) error {
 		serviceAccountName,
 		helperPodYaml,
 		c.Bool(FlagAllowUnsafeHelperPodTemplate),
+		c.Bool(FlagAllowPrivilegedXFSProjectQuota),
+		c.String(FlagXFSProjectQuotaHelperImage),
 	)
 	if err != nil {
 		return err

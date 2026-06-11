@@ -21,6 +21,24 @@ data:
             }
             ]
     }
+  quota-config-example.json: |-
+    {
+      "storageClassConfigs": {
+        "local-path-xfs-quota": {
+          "nodePathMap": [
+            {
+              "node": "DEFAULT_PATH_FOR_NON_LISTED_NODES",
+              "paths": ["/mnt/xfs-local-path"]
+            }
+          ],
+          "quota": {
+            "type": "xfsProject",
+            "projectIDStart": 1048576,
+            "projectIDEnd": 2147483647
+          }
+        }
+      }
+    }
   setup: |-
     #!/bin/sh
     set -eu
